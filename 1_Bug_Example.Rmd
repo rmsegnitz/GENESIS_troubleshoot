@@ -1,0 +1,376 @@
+---
+title: "GENESIS Bug Demo"
+author: "Max Segnitz"
+date: "2/18/2022"
+output: html_document
+---
+
+# Reproduce GENESIS bug with confounding covariate.
+
+Reproduce a bug encountered in GENESIS. We found that when a model covariate (in our case "sex") was fully confounded with 
+a SNP genotype, GENSIS returns a highly significant result despite no true association. This is likely only encountered when
+sample sizes are small and snp-variable counfounding occur by chance.
+
+Here, we reproduce the error using sample data available in the **SNPRelate** package.
+
+```{r, warning=F, message=F}
+# Load libraries
+library(tidyverse)
+library(gdsfmt)
+library(GENESIS)
+library(GWASTools)
+library(SNPRelate)
+library(kableExtra)
+library(scales)
+library(ggbeeswarm)
+library(ggrepel)
+```
+
+## Format Sample Data
+
+
+### Load sample data and randomly subset individuals
+
+Use sample data from **SNPRelate** and randomly subsample to 150 individuals.
+
+```{r}
+# Ensure any GDS links are closed
+showfile.gds(closeall=TRUE)
+
+# Open filelink to GDS genotype data
+snp_gds <- GdsGenotypeReader(filename = snpgdsExampleFileName())
+
+```
+
+The example data includes `r length(getScanID(snp_gds))` individuals and `r length(getSnpID(snp_gds))` SNPs.
+
+## Randomly subset individuals
+
+Randomly subset the indivuals in the GDS to a sample size of 150.
+
+```{r}
+# Randomly subset individuals
+set.seed(32)
+id_subset<-sample(getScanID(snp_gds), size = 150)
+  
+```
+
+## Create corresponding .gds
+
+Subset GDS to randomly sampled individuals.
+
+```{r}
+
+# Ensure any GDS links are closed
+showfile.gds(closeall=TRUE)
+
+# Temporarily Subset GDS to PIDs in condition subset
+gdsSubset(parent.gds = snpgdsExampleFileName(),
+          sub.gds = "data/sample_subset.gds",
+          sample.include = id_subset) # filter to relevent samples
+
+
+# Open filelink to GDS genotype data
+snp_gds_sub <- GdsGenotypeReader(filename =  "data/sample_subset.gds")
+
+```
+
+## Create dummy phenotype & metadata
+
+Create a simulated phenotype against which to test  SNP association.
+
+```{r}
+# Create Dummy Data with Modest Effect
+set.seed(28)
+
+pheno_meta<-
+  data.frame(scanID = id_subset, 
+             phenotype = rnorm(150, mean = 150, sd = 50))
+
+
+
+```
+
+## Randomly select SNP for confounding effect
+
+Randomly select a SNP with only 2 genotypes & create a perfectly confounded dummy covariate.
+
+```{r}
+# create function to randomly select SNP with right properties
+random_selection<-
+  function(gds){
+              success<-FALSE
+              while(!success){ # Run loop to randomly generate snp until conditions are met
+              rand_snp_index<-sample(1:length(getSnpID(gds)), size=1)
+              rand_genotype<- getGenotype(gds)[rand_snp_index,]
+              success<-length(unique(rand_genotype[which(!is.na(rand_genotype))]))==2 & sum(rand_genotype, na.rm = T)>=10 # only select snp if there are only 2 genotypes & enough uncommon present
+                      }
+              rand_snp<-getSnpID(gds)[rand_snp_index]
+              return(list(snp=rand_snp, geno = rand_genotype))
+              }
+
+# Randomly generate SNP
+set.seed(32)
+snp_random<-random_selection(snp_gds_sub)
+
+# Pair with PIDs
+snp_random_ids<-
+  data.frame(scanID=getScanID(snp_gds_sub), snp=snp_random$snp, genotype=snp_random$geno)
+
+```
+
+Create dummy covariate confounded with SNP.
+
+```{r}
+pheno_meta_dummy<-
+  inner_join(pheno_meta, snp_random_ids)%>%
+  mutate(cov_dummy = as.numeric(as.factor(genotype)))%>%
+  mutate(cov_dummy = factor(case_when(cov_dummy==1 ~ "A", cov_dummy ==2 ~ "B"), levels=c("A", "B")))
+  
+```
+
+Plot effect by genotype, showing dummy grouping.
+
+The snp shows no association to phenotype.
+
+```{r}
+# test for dummy variable effect using t-test and linear model
+
+dummy_ttest<-t.test(phenotype~cov_dummy, data = pheno_meta_dummy)
+
+dummy_lm<-lm(phenotype ~ cov_dummy, data = pheno_meta_dummy)
+
+pheno_meta_dummy%>%
+  ggplot(aes(x=as.factor(genotype), y=phenotype))+
+  geom_boxplot(outlier.shape = NA, fill=NA)+
+  ggbeeswarm::geom_quasirandom(aes(color=cov_dummy))+
+  labs(color="Dummy Covariate")+
+  ggtitle(paste0("Two Sample t-test p=", round(dummy_ttest$p.value, 3), 
+                "\nLM p=", round(summary(dummy_lm)$coefficients[2,4], 3)))+
+  xlab("Genotype")+
+  ylab("Phenotype")+
+  theme_bw()+
+  theme(panel.grid = element_blank())
+  
+```
+
+# Run GWAS
+
+Run association tests of SNPs to phenotype using GENESIS. 
+
+```{r}
+
+# Ensure any GDS links are closed
+showfile.gds(closeall=TRUE)
+
+# Open filelink to GDS genotype data
+snp_gds_sub <- GdsGenotypeReader(filename =  "data/sample_subset.gds")
+
+# Format Phenotypes as ScanAnnotation
+pheno_dat<-
+  pheno_meta_dummy%>%
+  arrange(match(scanID, getScanID(snp_gds_sub)))%>% # match scan order to GDS
+  ScanAnnotationDataFrame() # Convert to Scan Annotation format
+
+
+# Format GDS as GenotypeData
+snp_genoData <- GenotypeData(snp_gds_sub, scanAnnot = pheno_dat)
+
+
+###############################
+##
+##         RUN GWAS
+##
+################################
+
+#------------------
+# Fit Null Model
+#------------------
+
+# Covariates = PCs 1-5
+nullmod <- 
+  fitNullModel(pheno_dat, 
+               outcome = "phenotype", 
+               covars = c("cov_dummy"), 
+               cov.mat = NULL, family = "gaussian")
+
+# Check that dummy covariate is not significant & is as expected
+nullmod$fixef%>%
+  kable(caption = "GENSIS Null Model Covariate Fit")%>%
+  kable_styling(bootstrap_options = "striped", full_width =F)
+
+# Check that NULL model is equivalent to simple lm
+nullmodLM<-lm(phenotype ~ cov_dummy , data=pheno_meta_dummy)
+
+nullmodLM%>%
+  broom::tidy()%>%
+  kable(caption = "LM Null Model Covariate Fit")%>%
+  kable_styling(bootstrap_options = "striped", full_width =F)
+
+
+#------------------------
+# Test SNP Associations
+#------------------------
+# Define interation blocks
+genoIterator <- 
+  GenotypeBlockIterator(genoData = snp_genoData, 
+                        snpBlock=5000)
+
+# Test associations
+test_snp_assoc <- 
+  assocTestSingle(genoIterator, null.model = nullmod)%>%
+  mutate(cov_dummy_snp = snp_random$snp)%>%
+  arrange(Score.pval)  
+
+
+```
+## Inspect GWAS results
+
+Plot results of GWAS using volcano plot. We observe an extreme outlying result for the SNP used to create a confounding covariate.
+
+```{r}
+# Plot Results
+
+# Create custom log-style x axis transformer (...,-10,-3,-1,0,1,3,10,...)
+custom_log_x_trans <- function(){
+  trans_new("custom_log_x",
+            transform = function (x) ( sign(x)*log(abs(x)+1) ),
+            inverse = function (y) ( sign(y)*( exp(abs(y))-1) ),
+            domain = c(-Inf,Inf))
+}
+
+# Custom log x breaker (...,-10,-3,-1,0,1,3,10,...)
+custom_x_breaks <- function(x)
+{ 
+  range <- max(abs(x), na.rm=TRUE)
+
+  return (sort( c(0,
+                  sapply(0:log10(range), function(z) (10^z) ),
+                  sapply(0:log10(range/3), function(z) (3*10^z) ),
+                  sapply(0:log10(range), function(z) (-10^z) ),
+                  sapply(0:log10(range/3), function(z) (-3*10^z) )
+  )))
+}
+
+test_snp_assoc%>%
+  mutate(col_group=case_when(Est>0 ~ "pos", Est<0 ~ "neg"))%>%
+  mutate(plot_lab=ifelse(variant.id==snp_random$snp, paste0("snp_id=", snp_random$snp), NA))%>%
+  ggplot(aes(x=Est, y=-log10(Score.pval)))+
+  geom_point(alpha=0.25, aes(color=col_group))+
+  ggrepel::geom_label_repel(aes(label=plot_lab))+
+  scale_color_manual(values=c("pos" = "red", "neg" = "dodgerblue"), guide="none")+
+  coord_trans(x="custom_log_x") +
+  scale_x_continuous(breaks = custom_x_breaks(test_snp_assoc$Est)[1:length(custom_x_breaks(test_snp_assoc$Est))*6]) +
+  ggtitle("GENESIS GWAS Results")+
+  xlab("Model Estimate \n(log10 Scale)")+
+  ylab("-log10(GWAS P Val)")+
+  theme_bw()+
+  theme(panel.grid = element_blank())
+
+```
+
+```{r}
+# Inspect top hits
+test_snp_assoc%>%
+  head()%>%
+  kable()%>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+```
+
+## Compare top hits to LM estimates
+
+Compare GENESIS fits to those from standard linear model fit using lm().
+
+
+```{r}
+snp_genos<-
+  getGenotype(snp_gds_sub)%>%
+  as.data.frame(getSnpID(snp_gds_sub))%>%
+  mutate(snpID = getSnpID(snp_gds_sub))
+
+colnames(snp_genos)<- c(getScanID(snp_gds_sub), "snpID")
+
+
+snp_genos<-
+  snp_genos%>%
+  mutate(snpID = paste0("snp_", snpID))%>%
+  dplyr::select(snpID, everything())
+
+
+# Combine with Phenotype data
+pheno_meta_dummy_wSnps<-
+snp_genos%>%
+  column_to_rownames("snpID")%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("scanID")%>%
+  right_join(pheno_meta_dummy)%>%
+  pivot_longer(contains("snp_"), names_to="snp_id", values_to = "geno")
+
+# Fit LM models to snps
+snp_lmMod<-
+  pheno_meta_dummy_wSnps%>%
+  group_by(snp_id)%>%
+  nest()%>%
+  mutate(lmFit = map(data, ~ lm(phenotype ~ geno + cov_dummy, data = .x)),
+         tidied = map(lmFit, broom::tidy))%>%
+  unnest(tidied)%>%
+  dplyr::select(-c(data, lmFit))
+
+```
+
+Compare pValues and Estimates to GENESIS results.
+
+```{r}
+comparison_df<-
+  snp_lmMod%>%
+  filter(term=="geno")%>%
+  dplyr::select(snp_id, estimate, p.value)%>%
+  mutate(method="LM")%>%
+  bind_rows(
+    test_snp_assoc%>%
+      dplyr::select(variant.id, Est, Score.pval)%>%
+      dplyr::rename(snp_id=variant.id, estimate=Est, p.value=Score.pval)%>%
+      mutate(snp_id = paste0("snp_", snp_id), method="GENESIS")
+  )%>%
+  mutate(logp=-log10(p.value))%>%
+  dplyr::select(-c(p.value))%>%
+  pivot_longer(c(logp, estimate), names_to = "measure", values_to = "value")%>%
+ 
+  pivot_wider(names_from = method, values_from = value)
+
+```
+
+```{r}
+
+# Plot comparison
+comparison_df%>%
+  mutate(measure = case_when(measure =="estimate" ~ "Model Estimate", 
+                             measure=="logp" ~ "Log10 PVal"))%>%
+  mutate(plot_lab = ifelse(snp_id==paste0( "snp_", snp_random$snp), snp_id, NA))%>%
+  ggplot(aes(x=LM, y=GENESIS))+
+  geom_point(alpha=0.5)+
+  ggrepel::geom_label_repel(aes(label=plot_lab))+
+  geom_abline(slope = 1, intercept = 0, linetype="dashed", size=0.25)+
+  ggtitle("Comparison of GENESIS results to LM Fit")+
+  facet_wrap(~measure, scales="free")+
+  theme_bw()+
+  theme(panel.grid = element_blank())
+
+# Plot comparison w/o outlier
+comparison_df%>%
+    mutate(measure = case_when(measure =="estimate" ~ "Model Estimate", 
+                             measure=="logp" ~ "Log10 PVal"))%>%
+  filter(snp_id != paste0("snp_",snp_random$snp))%>%
+  ggplot(aes(x=LM, y=GENESIS))+
+  geom_point(alpha=0.5)+
+  geom_abline(slope = 1, intercept = 0, linetype="dashed", size=0.25)+
+  ggtitle("Comparison of GENESIS results to LM Fit")+
+  labs(subtitle = ("Outlier/Bug point removed)"))+
+  facet_wrap(~measure, scales="free")+
+  theme_bw()+
+  theme(panel.grid = element_blank())
+```
+
+
